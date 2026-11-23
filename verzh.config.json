@@ -1,0 +1,8 @@
+{
+  "releaseBranch": "production",
+  "preReleaseBranches": {},
+  "autoPushToRemote": true,
+  "updatePackageJson": false,
+  "remote": "origin",
+  "preScript": ""
+}

@@ -1,0 +1,317 @@
+name: CI / CD
+
+on:
+  # Local `npx verzh bump` creates and pushes a tag. That push builds and deploys.
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: "Type of version bump"
+        required: true
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - pre-release
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    # actions: read lets a tag push see an in-progress manual release and skip a second deploy.
+    # The verzh push still uses secrets.GH_ORG_TOKEN, which is independent of GITHUB_TOKEN.
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      project_name: ${{ github.event.repository.name }}
+      tag_name: ${{ steps.resolve.outputs.tag_name || steps.bump.outputs.tag_name }}
+      git_branch: ${{ steps.resolve.outputs.git_branch || steps.validate.outputs.git_branch }}
+      should_release: ${{ steps.resolve.outputs.should_release || steps.commits.outputs.should_release }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_ORG_TOKEN }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # Tag push: the version already exists. Resolve which configured branch it belongs to.
+      - name: Resolve pushed tag
+        id: resolve
+        if: github.event_name == 'push'
+        env:
+          TAG_REF: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if ! echo "$TAG_REF" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$'; then
+            echo "::error::Invalid tag format. Must be a semantic version (e.g. 1.0.13 or 1.0.13-rc.1)."
+            exit 1
+          fi
+
+          if [ ! -f verzh.config.json ]; then
+            echo "::error::verzh.config.json not found"
+            exit 1
+          fi
+
+          RELEASE_BRANCH=$(jq -r '.releaseBranch' verzh.config.json)
+          if [ -z "$RELEASE_BRANCH" ] || [ "$RELEASE_BRANCH" = "null" ]; then
+            echo "::error::verzh.config.json is missing releaseBranch"
+            exit 1
+          fi
+
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*' --no-tags
+
+          TAG_COMMIT=$(git rev-list -n 1 "refs/tags/${TAG_REF}")
+          mapfile -t CANDIDATES < <(jq -r '[.releaseBranch] + (.preReleaseBranches // {} | keys) | .[]' verzh.config.json)
+
+          BEST=""
+          BEST_DISTANCE=-1
+          for BRANCH in "${CANDIDATES[@]}"; do
+            if ! git rev-parse --verify --quiet "refs/remotes/origin/${BRANCH}" >/dev/null; then
+              continue
+            fi
+            if ! git merge-base --is-ancestor "$TAG_COMMIT" "refs/remotes/origin/${BRANCH}"; then
+              continue
+            fi
+
+            DISTANCE=$(git rev-list --count "${TAG_COMMIT}..refs/remotes/origin/${BRANCH}")
+            if [ "$BEST_DISTANCE" -lt 0 ] || [ "$DISTANCE" -lt "$BEST_DISTANCE" ]; then
+              BEST="$BRANCH"
+              BEST_DISTANCE="$DISTANCE"
+            elif [ "$DISTANCE" -eq "$BEST_DISTANCE" ]; then
+              # Same commit on two configured branches: stable tags follow the release branch.
+              if [[ "$TAG_REF" != *-* && "$BRANCH" == "$RELEASE_BRANCH" ]]; then
+                BEST="$BRANCH"
+              fi
+              if [[ "$TAG_REF" == *-* && "$BRANCH" != "$RELEASE_BRANCH" && "$BEST" == "$RELEASE_BRANCH" ]]; then
+                BEST="$BRANCH"
+              fi
+            fi
+          done
+
+          if [ -z "$BEST" ]; then
+            echo "::error::Tag ${TAG_REF} is not on the release branch or a pre-release branch from verzh.config.json."
+            exit 1
+          fi
+
+          IS_PRE_RELEASE=$(jq -r --arg b "$BEST" 'if .preReleaseBranches[$b] then "true" else "false" end' verzh.config.json)
+          if [[ "$TAG_REF" != *-* && "$BEST" != "$RELEASE_BRANCH" ]]; then
+            echo "::error::Release tag ${TAG_REF} resolved to '${BEST}', which is not the release branch (${RELEASE_BRANCH})."
+            exit 1
+          fi
+          if [[ "$TAG_REF" == *-* && "$IS_PRE_RELEASE" != "true" ]]; then
+            echo "::error::Pre-release tag ${TAG_REF} resolved to '${BEST}', which is not a pre-release branch."
+            exit 1
+          fi
+
+          echo "Tag ${TAG_REF} (${TAG_COMMIT}) is on ${BEST}, ${BEST_DISTANCE} commit(s) behind the branch tip."
+
+          SHOULD_RELEASE=true
+          # workflow_dispatch pushes this same tag with a PAT, which starts a second run.
+          # That manual run already builds and deploys, so this one stands down.
+          if IN_PROGRESS=$(gh run list \
+            --workflow "ci-cd.yml" \
+            --event workflow_dispatch \
+            --status in_progress \
+            --json headSha \
+            --jq '.[].headSha'); then
+            while IFS= read -r SHA; do
+              [ -z "$SHA" ] && continue
+              if ! git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
+                continue
+              fi
+              if [ "$SHA" = "$TAG_COMMIT" ] || git merge-base --is-ancestor "$SHA" "$TAG_COMMIT"; then
+                echo "::notice::A manual release is already building ${TAG_REF}. Skipping this tag run."
+                SHOULD_RELEASE=false
+                break
+              fi
+            done <<< "$IN_PROGRESS"
+          else
+            echo "::warning::Could not list in-progress workflow runs. Continuing with this tag."
+          fi
+
+          echo "tag_name=${TAG_REF}" >> "$GITHUB_OUTPUT"
+          echo "git_branch=${BEST}" >> "$GITHUB_OUTPUT"
+          echo "should_release=${SHOULD_RELEASE}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Branch against verzh.config.json
+        id: validate
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          BUMP="${{ inputs.version_bump }}"
+
+          if [ ! -f verzh.config.json ]; then
+            echo "::error::verzh.config.json not found"
+            exit 1
+          fi
+
+          # Extract branch rules from config
+          RELEASE_BRANCH=$(jq -r '.releaseBranch' verzh.config.json)
+          IS_PRE_RELEASE=$(jq -r --arg b "$BRANCH" 'if .preReleaseBranches[$b] then "true" else "false" end' verzh.config.json)
+
+          echo "Current Branch: $BRANCH"
+          echo "Configured Release Branch: $RELEASE_BRANCH"
+          echo "Is Pre-release Branch: $IS_PRE_RELEASE"
+
+          # Rule 1: No pre-releases on the main release branch
+          if [[ "$BRANCH" == "$RELEASE_BRANCH" && "$BUMP" == "pre-release" ]]; then
+            echo "::error::Pre-releases are not allowed on the release branch ($RELEASE_BRANCH)."
+            exit 1
+          fi
+
+          # Rule 2: Pre-release branches ONLY accept pre-releases
+          if [[ "$IS_PRE_RELEASE" == "true" && "$BUMP" != "pre-release" ]]; then
+            echo "::error::Branch '$BRANCH' is a pre-release branch. It only accepts 'pre-release' bumps."
+            exit 1
+          fi
+
+          # Rule 3: Fail if the branch isn't listed in the config at all
+          if [[ "$BRANCH" != "$RELEASE_BRANCH" && "$IS_PRE_RELEASE" != "true" ]]; then
+            echo "::error::Branch '$BRANCH' is not configured in verzh.config.json for releases or pre-releases."
+            exit 1
+          fi
+
+          echo "git_branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Check for new commits since current version
+        id: commits
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          CURRENT=$(git describe --tags --abbrev=0 2>/dev/null || true)
+
+          if [ -z "$CURRENT" ]; then
+            echo "No version tags found; proceeding with release."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          COMMIT_COUNT=$(git rev-list "${CURRENT}..HEAD" --count)
+          echo "Commits since ${CURRENT}: ${COMMIT_COUNT}"
+
+          if [ "$COMMIT_COUNT" -eq 0 ]; then
+            echo "::notice::No new commits since ${CURRENT}. Skipping tag creation, build, and deploy."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node.js
+        if: github.event_name == 'workflow_dispatch' && steps.commits.outputs.should_release == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "25.9.0"
+
+      - name: Configure Git User
+        if: github.event_name == 'workflow_dispatch' && steps.commits.outputs.should_release == 'true'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Run verzh
+        id: bump
+        if: github.event_name == 'workflow_dispatch' && steps.commits.outputs.should_release == 'true'
+        # autoPushToRemote: true in verzh.config.json — verzh pushes the tag/commit.
+        # Checkout token (PERSONAL_ACCESS_TOKEN) is used for that push.
+        run: |
+          npx verzh@latest bump -t "${{ inputs.version_bump }}" -f
+          TAG_NAME=$(git describe --tags --abbrev=0)
+          echo "Created version: $TAG_NAME"
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+
+  build:
+    runs-on: ubuntu-latest
+    needs: tag
+    if: needs.tag.outputs.should_release == 'true'
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.tag.outputs.tag_name }}
+
+      - name: Build docker image and push to GHCR
+        uses: mr-smithers-excellent/docker-build-push@v3
+        with:
+          image: powerlearnpro/${{ needs.tag.outputs.project_name }}
+          tag: ${{ needs.tag.outputs.tag_name }}
+          buildArgs: VERSION=${{ needs.tag.outputs.tag_name }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GH_ORG_TOKEN }}
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [tag, build]
+    if: needs.tag.outputs.should_release == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout docker-compose repository
+        uses: actions/checkout@v4
+        with:
+          repository: PowerlearnPro/infrastructure
+          token: ${{ secrets.GH_ORG_TOKEN }}
+          path: infrastructure
+          ref: ${{ needs.tag.outputs.git_branch }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "25.9.0"
+          cache: "npm"
+          cache-dependency-path: infrastructure/package-lock.json
+
+      - name: Install dependencies
+        working-directory: infrastructure
+        run: npm ci # Use npm ci instead of npm i for reproducible builds
+
+      - name: Set up Git user
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+      - name: Validate inputs before deployment
+        env:
+          SERVICE_NAME: ${{ needs.tag.outputs.project_name }}
+          VERSION: ${{ needs.tag.outputs.tag_name }}
+        run: |
+          # Additional validation before running deployment script
+          if [ -z "$SERVICE_NAME" ] || [ -z "$VERSION" ]; then
+            echo "ERROR: Missing required deployment parameters"
+            exit 1
+          fi
+
+          # Validate service name and version
+          if ! echo "$SERVICE_NAME" | grep -qE '^[a-zA-Z0-9_-]+$'; then
+            echo "ERROR: Invalid service name"
+            exit 1
+          fi
+
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "ERROR: Invalid version format"
+            exit 1
+          fi
+
+      - name: Run deployment script
+        working-directory: infrastructure
+        env:
+          SERVICE_NAME: ${{ needs.tag.outputs.project_name }}
+          VERSION: ${{ needs.tag.outputs.tag_name }}
+        run: |
+          chmod +x scripts/update-service.mjs
+          # Use environment variables instead of direct parameter passing
+          npm run update-service -- --service "$SERVICE_NAME" --version "$VERSION"

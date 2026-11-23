@@ -1,0 +1,12 @@
+.git
+.github
+.idea
+.vscode
+*.swp
+*.log
+*.test
+*.out
+idscan-server
+.env
+.env.*
+README.md
